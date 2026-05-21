@@ -5,15 +5,18 @@ Effectful shell - the only place I/O lives.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Callable, Generator, Optional
 
 import numpy as np
+import pandas as pd
 
 from .types import DisplayUpdate, SpectralResult
 
 
 SensorReader = Callable[[], float]
 ChannelReadings = dict[str, float]
+DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "test.csv"
 
 
 def simulate_signal(
@@ -47,12 +50,40 @@ def simulate_channel_readers() -> dict[str, SensorReader]:
     }
 
 
+def _series_reader(series: pd.Series) -> SensorReader:
+    values = pd.to_numeric(series, errors="coerce").dropna().astype(float).tolist()
+    if not values:
+        raise ValueError("CSV source requires at least one numeric value")
+
+    index = 0
+
+    def _read() -> float:
+        nonlocal index
+        value = values[index]
+        if index < len(values) - 1:
+            index += 1
+        return value
+
+    return _read
+
+
+def csv_source(data: Optional[pd.DataFrame] = None) -> dict[str, SensorReader]:
+    """Return a CSV-backed RPM source that advances one row per read."""
+
+    frame = data if data is not None else pd.read_csv(DEFAULT_CSV_PATH)
+    if "bit_rpm" not in frame:
+        raise KeyError("CSV source requires a 'bit_rpm' column")
+
+    return {"RPM": _series_reader(frame["bit_rpm"])}
+
+
 def sensor_stream(
     sample_rate: float = 50.0,
     channels: tuple[str, ...] = ("RPM", "Torque"),
     sources: Optional[dict[str, SensorReader]] = None,
 ) -> Generator[tuple[ChannelReadings, float], None, None]:
     """Yield per-channel scalar readings at the requested sample rate."""
+
     readers = sources or simulate_channel_readers()
     dt = 1.0 / sample_rate
 

@@ -1,5 +1,7 @@
 from stickslip.buffer import make_buffer
-from stickslip.shell import sensor_stream
+import pandas as pd
+
+from stickslip.shell import csv_source, sensor_stream
 from stickslip.transforms import bandpass, detrend, fft_analyze, windowed
 from stickslip.types import Signal
 
@@ -24,6 +26,17 @@ def test_sensor_stream_emits_both_channels_at_50hz():
     assert isinstance(readings["RPM"], float)
     assert isinstance(readings["Torque"], float)
     assert isinstance(timestamp, float)
+
+
+def test_csv_source_advances_through_bit_rpm_values():
+    frame = pd.DataFrame({"bit_rpm": [100.0, 101.5, 103.25]})
+    readers = csv_source(frame)
+
+    rpm = readers["RPM"]
+    assert rpm() == 100.0
+    assert rpm() == 101.5
+    assert rpm() == 103.25
+    assert rpm() == 103.25
 
 
 def test_fft_pipeline_returns_result():
