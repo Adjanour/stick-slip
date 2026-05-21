@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stickslip"
+version = "0.1.0"
+description = "Functional core / imperative shell pipeline for stick-slip detection"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.14",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+stickslip = "stickslip.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+include = ["stickslip*"]
