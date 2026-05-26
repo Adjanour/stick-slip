@@ -1,5 +1,5 @@
 """
-Effectful shell - the only place I/O lives.
+Effectful shell — I/O lives here so the core stays pure.
 """
 
 from __future__ import annotations
@@ -9,13 +9,9 @@ from pathlib import Path
 from typing import Callable, Generator, Optional
 
 import numpy as np
-import pandas as pd
-
-from .types import DisplayUpdate, SpectralResult
 
 
 SensorReader = Callable[[], float]
-ChannelReadings = dict[str, float]
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "test.csv"
 
 
@@ -25,8 +21,6 @@ def simulate_signal(
     stick_slip_amplitude: float = 30.0,
     noise_std: float = 2.0,
 ) -> SensorReader:
-    """Return a synthetic scalar sensor source for one drilling channel."""
-
     def _read() -> float:
         t = time.time()
         return (
@@ -38,53 +32,67 @@ def simulate_signal(
     return _read
 
 
-def simulate_channel_readers() -> dict[str, SensorReader]:
-    """Return independent RPM and Torque sources for acquisition demos."""
-    return {
-        "RPM": simulate_signal(
-            base=120.0, stick_slip_hz=0.5, stick_slip_amplitude=30.0, noise_std=2.0
-        ),
-        "Torque": simulate_signal(
-            base=1800.0, stick_slip_hz=0.5, stick_slip_amplitude=120.0, noise_std=8.0
-        ),
-    }
+# Loads a single column from CSV using numpy's structured array reader
+def _load_csv_column(path: Path) -> np.ndarray:
+    data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
+    if "bit_rpm" not in data.dtype.names:
+        raise KeyError("CSV source requires a 'bit_rpm' column")
+    return data["bit_rpm"].astype(np.float64)
 
 
-def _series_reader(series: pd.Series) -> SensorReader:
-    values = pd.to_numeric(series, errors="coerce").dropna().astype(float).tolist()
-    if not values:
+# Closure-based reader: advances through values, holds last on exhaustion
+def _values_reader(values: np.ndarray) -> SensorReader:
+    values = np.asarray(values, dtype=np.float64)
+    if len(values) == 0:
         raise ValueError("CSV source requires at least one numeric value")
 
     index = 0
+    n = len(values)
 
     def _read() -> float:
         nonlocal index
-        value = values[index]
-        if index < len(values) - 1:
+        value = float(values[index])
+        if index < n - 1:
             index += 1
         return value
 
     return _read
 
 
-def csv_source(data: Optional[pd.DataFrame] = None) -> dict[str, SensorReader]:
-    """Return a CSV-backed RPM source that advances one row per read."""
+def csv_source(data: Optional[np.ndarray] = None) -> SensorReader:
+    values = data if data is not None else _load_csv_column(DEFAULT_CSV_PATH)
+    return _values_reader(values)
 
-    frame = data if data is not None else pd.read_csv(DEFAULT_CSV_PATH)
-    if "bit_rpm" not in frame:
-        raise KeyError("CSV source requires a 'bit_rpm' column")
 
-    return {"RPM": _series_reader(frame["bit_rpm"])}
+# Yields fixed-size chunks, sleeping to maintain the target sample rate
+def csv_chunk_stream(
+    sample_rate: float = 50.0,
+    chunk_size: int = 10,
+    data: Optional[np.ndarray] = None,
+) -> Generator[tuple[np.ndarray, float], None, None]:
+    reader = csv_source(data)
+    dt = 1.0 / sample_rate
+
+    while True:
+        t0 = time.time()
+        chunk = np.array([reader() for _ in range(chunk_size)], dtype=np.float64)
+        yield chunk, t0
+
+        elapsed = time.time() - t0
+        sleep_time = dt * chunk_size - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 def sensor_stream(
     sample_rate: float = 50.0,
     channels: tuple[str, ...] = ("RPM", "Torque"),
     sources: Optional[dict[str, SensorReader]] = None,
-) -> Generator[tuple[ChannelReadings, float], None, None]:
-    """Yield per-channel scalar readings at the requested sample rate."""
-
-    readers = sources or simulate_channel_readers()
+) -> Generator[tuple[dict[str, float], float], None, None]:
+    readers = sources or {
+        "RPM": simulate_signal(120.0, 0.5, 30.0, 2.0),
+        "Torque": simulate_signal(1800.0, 0.5, 120.0, 8.0),
+    }
     dt = 1.0 / sample_rate
 
     while True:
@@ -96,42 +104,3 @@ def sensor_stream(
         sleep_time = dt - elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
-
-
-def throttled_display(
-    update_rate_hz: float = 1.0,
-) -> Callable[[SpectralResult], Optional[DisplayUpdate]]:
-    """Return a display gate that emits at most once per channel per interval."""
-
-    last_emit: dict[str, float] = {}
-    min_interval = 1.0 / update_rate_hz
-
-    def _maybe_emit(result: SpectralResult) -> Optional[DisplayUpdate]:
-        now = result.timestamp
-        previous = last_emit.get(result.channel, 0.0)
-        if now - previous >= min_interval:
-            last_emit[result.channel] = now
-            return DisplayUpdate(
-                timestamp=now,
-                channel=result.channel,
-                peak_frequency=result.peak_frequency,
-                severity_index=result.severity_index,
-            )
-        return None
-
-    return _maybe_emit
-
-
-def render_display(update: DisplayUpdate) -> None:
-    """Render one channel update to stdout."""
-    bar_len = 30
-    normalised = min(update.severity_index * 500, 1.0)
-    bar = "█" * int(normalised * bar_len) + "░" * (bar_len - int(normalised * bar_len))
-
-    print(
-        f"[{update.channel:>6}]  "
-        f"t={update.timestamp:>10.3f}s  │  "
-        f"Peak: {update.peak_frequency:>6.3f} Hz  │  "
-        f"Severity: {update.severity_index:.5f}  │  "
-        f"[{bar}]"
-    )

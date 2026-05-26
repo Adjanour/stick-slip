@@ -1,11 +1,9 @@
-from stickslip.buffer import make_buffer
-import pandas as pd
+import numpy as np
 
+from stickslip.buffer import make_buffer
 from stickslip.shell import csv_source, sensor_stream
 from stickslip.transforms import bandpass, detrend, fft_analyze, windowed
 from stickslip.types import Signal
-
-import numpy as np
 
 
 def test_buffer_becomes_full_and_converts_to_signal():
@@ -29,10 +27,8 @@ def test_sensor_stream_emits_both_channels_at_50hz():
 
 
 def test_csv_source_advances_through_bit_rpm_values():
-    frame = pd.DataFrame({"bit_rpm": [100.0, 101.5, 103.25]})
-    readers = csv_source(frame)
-
-    rpm = readers["RPM"]
+    values = np.array([100.0, 101.5, 103.25])
+    rpm = csv_source(values)
     assert rpm() == 100.0
     assert rpm() == 101.5
     assert rpm() == 103.25
