@@ -46,6 +46,7 @@ class RollingBuffer:
         )
 
     def to_signal(self) -> Optional[Signal]:
+        """Returns None until the buffer is full (avoids partial-window FFT artifacts)."""
         if not self.is_full:
             return None
         return Signal(

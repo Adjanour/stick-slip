@@ -21,6 +21,8 @@ def simulate_signal(
     stick_slip_amplitude: float = 30.0,
     noise_std: float = 2.0,
 ) -> SensorReader:
+    """Synthetic sensor: sine wave at torsional frequency + Gaussian noise."""
+
     def _read() -> float:
         t = time.time()
         return (
@@ -32,12 +34,12 @@ def simulate_signal(
     return _read
 
 
-# Loads a single column from CSV using numpy's structured array reader
-def _load_csv_column(path: Path) -> np.ndarray:
+# Loads a named column from CSV using numpy's structured array reader
+def _load_csv_column(path: Path, column: str = "bit_rpm") -> np.ndarray:
     data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
-    if "bit_rpm" not in data.dtype.names:
-        raise KeyError("CSV source requires a 'bit_rpm' column")
-    return data["bit_rpm"].astype(np.float64)
+    if column not in data.dtype.names:
+        raise KeyError(f"CSV source requires a '{column}' column")
+    return data[column].astype(np.float64)
 
 
 # Closure-based reader: advances through values, holds last on exhaustion
@@ -59,18 +61,23 @@ def _values_reader(values: np.ndarray) -> SensorReader:
     return _read
 
 
-def csv_source(data: Optional[np.ndarray] = None) -> SensorReader:
-    values = data if data is not None else _load_csv_column(DEFAULT_CSV_PATH)
+def csv_source(
+    data: Optional[np.ndarray] = None,
+    column: str = "bit_rpm",
+) -> SensorReader:
+    """Closure that advances through column values, holding the last on exhaustion."""
+    values = data if data is not None else _load_csv_column(DEFAULT_CSV_PATH, column)
     return _values_reader(values)
 
 
-# Yields fixed-size chunks, sleeping to maintain the target sample rate
 def csv_chunk_stream(
     sample_rate: float = 50.0,
     chunk_size: int = 10,
     data: Optional[np.ndarray] = None,
+    column: str = "bit_rpm",
 ) -> Generator[tuple[np.ndarray, float], None, None]:
-    reader = csv_source(data)
+    """Yields fixed-size numpy chunks, sleeping between chunks to maintain the target sample rate."""
+    reader = csv_source(data, column=column)
     dt = 1.0 / sample_rate
 
     while True:
@@ -89,6 +96,7 @@ def sensor_stream(
     channels: tuple[str, ...] = ("RPM", "Torque"),
     sources: Optional[dict[str, SensorReader]] = None,
 ) -> Generator[tuple[dict[str, float], float], None, None]:
+    """Multi-channel sensor loop: reads all channels, sleeps to maintain sample rate."""
     readers = sources or {
         "RPM": simulate_signal(120.0, 0.5, 30.0, 2.0),
         "Torque": simulate_signal(1800.0, 0.5, 120.0, 8.0),

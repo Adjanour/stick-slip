@@ -10,7 +10,8 @@ from .types import SidebandResult
 
 
 class ModulationHistory:
-    # Pre-allocated ring buffer: _head wraps around, overwrites oldest entry
+    """Ring buffer of (timestamp, modulation_index) pairs with least-squares growth-rate estimation."""
+
     def __init__(self, capacity: int = 30):
         self._capacity = capacity
         self._times = np.zeros(capacity, dtype=np.float64)

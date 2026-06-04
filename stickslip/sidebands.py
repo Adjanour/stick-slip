@@ -21,6 +21,7 @@ def detect_sidebands(
     search_window_hz: float = 0.15,
     min_ratio: float = 0.05,
 ) -> SidebandResult:
+    """Search for FM sidebands at fc ± n·fm within ±search_window_hz of each expected peak."""
     freqs = spectral.frequencies
     mags = spectral.magnitudes
     fc = spectral.peak_frequency
@@ -80,7 +81,7 @@ def detect_sidebands(
     mi = float(max(sb_ratios)) if sb_ratios else 0.0
     n = len(sb_orders)
 
-    def _arr(v, dtype):
+    def _arr(v: list, dtype: type) -> np.ndarray:
         return np.array(v, dtype=dtype) if n else np.array([], dtype=dtype)
 
     return SidebandResult(
@@ -143,7 +144,6 @@ def compute_fm(params: DrillStringParams) -> float:
 
 
 def _empty(fc: float, mc: float, fm: float, spectral: SpectralResult) -> SidebandResult:
-    z = np.array([], dtype=np.float64)
     return SidebandResult(
         carrier_frequency=fc,
         carrier_magnitude=mc,
@@ -154,8 +154,8 @@ def _empty(fc: float, mc: float, fm: float, spectral: SpectralResult) -> Sideban
         channel=spectral.channel,
         sb_orders=np.array([], dtype=np.int32),
         sb_is_upper=np.array([], dtype=bool),
-        sb_expected_hz=z,
-        sb_actual_hz=z,
-        sb_magnitudes=z,
-        sb_ratios=z,
+        sb_expected_hz=np.array([], dtype=np.float64),
+        sb_actual_hz=np.array([], dtype=np.float64),
+        sb_magnitudes=np.array([], dtype=np.float64),
+        sb_ratios=np.array([], dtype=np.float64),
     )
