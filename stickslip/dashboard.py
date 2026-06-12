@@ -6,6 +6,7 @@ Consumes all three event types and renders a rich terminal layout.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Optional
 
@@ -15,6 +16,17 @@ from rich.table import Table
 from rich.text import Text
 from rich.live import Live
 
+from .ssi import (
+    SSI_CRITICAL,
+    SSI_MILD,
+    SSI_MODERATE,
+    SSI_NONE,
+    SSI_SEVERE,
+    SSI_STYLE,
+    compute_ssi,
+    ssi_class,
+    ssi_description,
+)
 from .types import (
     ENERGY_BUILDING,
     ENERGY_NORMAL,
@@ -49,11 +61,14 @@ class Dashboard:
         self._energy: Optional[EnergyEvent] = None
         self._mitigation: Optional[MitigationSignal] = None
         self._events: deque[tuple[float, str, str]] = deque(maxlen=max_events)
+        self._drilling_paused = False
+        self._ssi_value = 0.0
 
     def on_stick_slip(self, event: StickSlipEvent) -> None:
         self._ss = event
+        self._ssi_value = compute_ssi(event.modulation_index)
         self._events.append(
-            (event.timestamp, "SB", f"{event.status}  MI={event.modulation_index:.4f}")
+            (event.timestamp, "SB", f"{event.status}  SSI={self._ssi_value:.1f}%")
         )
 
     def on_energy(self, event: EnergyEvent) -> None:
@@ -66,19 +81,45 @@ class Dashboard:
         self._mitigation = signal
         self._events.append((signal.timestamp, "CTRL", signal.reason[:55]))
 
+    def on_paused(self, paused: bool) -> None:
+        self._drilling_paused = paused
+
     def __rich__(self) -> Layout:
         layout = Layout()
-        layout.split_column(
-            Layout(self._build_header(), size=3),
-            Layout(self._build_columns(), size=8),
-            Layout(self._build_events(), size=12),
-        )
+        sections = [Layout(self._build_header(), size=3)]
+        if self._drilling_paused:
+            sections.append(Layout(self._build_paused_bar(), size=3))
+        elif self._ss and self._ssi_value >= 3.0:
+            sections.append(Layout(self._build_alert_bar(), size=3))
+        sections.append(Layout(self._build_columns(), size=8))
+        sections.append(Layout(self._build_events(), size=12))
+        layout.split_column(*sections)
         return layout
 
     def _build_header(self) -> Panel:
+        title = "STICK-SLIP DASHBOARD"
+        if self._drilling_paused:
+            title = "⚠  DRILLING PAUSED  ⚠"
         return Panel(
-            Text("STICK-SLIP DASHBOARD", style="bold white on blue", justify="center"),
+            Text(title, style="bold white on blue", justify="center"),
             border_style="blue",
+        )
+
+    def _build_paused_bar(self) -> Panel:
+        return Panel(
+            Text(" DRILLING PAUSED — RPM near zero for >6s ", style="bold white on red", justify="center"),
+            border_style="red",
+        )
+
+    def _build_alert_bar(self) -> Panel:
+        blink = " █ " if int(time.time() * 2) % 2 else "   "
+        return Panel(
+            Text(
+                f"{blink} STICK-SLIP DETECTED — SSI={self._ssi_value:.1f}% {blink} ",
+                style="bold white on red",
+                justify="center",
+            ),
+            border_style="red",
         )
 
     def _build_columns(self) -> Layout:
@@ -86,7 +127,7 @@ class Dashboard:
         cols.split_row(
             self._build_sideband_panel(),
             self._build_energy_panel(),
-            self._build_mitigation_panel(),
+            self._build_ssi_panel(),
         )
         return cols
 
@@ -129,22 +170,24 @@ class Dashboard:
 
         return Panel(t, title="Torsional Energy", border_style="yellow")
 
-    def _build_mitigation_panel(self) -> Panel:
-        m = self._mitigation
+    def _build_ssi_panel(self) -> Panel:
+        ssi = self._ssi_value
+        cls = ssi_class(ssi)
+        style = SSI_STYLE.get(cls, "white")
         t = Table.grid(padding=(0, 1))
         t.add_column()
         t.add_column(style="bold")
 
-        if m is not None:
-            t.add_row("RPM:", f"{m.rpm_setpoint:.1f}")
-            t.add_row("WOB:", f"{m.wob_setpoint:.0f} N")
-            t.add_row("Reason:", Text(m.reason[:50], style="dim"))
+        if self._ss is not None:
+            t.add_row("SSI:", Text(f"{ssi:.2f}%", style=f"bold {style}"))
+            t.add_row("Class:", Text(cls, style=style))
+            t.add_row("Description:", Text(ssi_description(ssi), style="dim"))
         else:
-            t.add_row("RPM:", Text("—", style="dim"))
-            t.add_row("WOB:", Text("—", style="dim"))
-            t.add_row("Reason:", Text("awaiting first event", style="dim"))
+            t.add_row("SSI:", Text("—", style="dim"))
+            t.add_row("Class:", Text("awaiting data", style="dim"))
+            t.add_row("Description:", Text("", style="dim"))
 
-        return Panel(t, title="Mitigation Setpoints", border_style="green")
+        return Panel(t, title="Stick-Slip Severity Index", border_style=style)
 
     def _build_events(self) -> Panel:
         t = Table.grid(padding=(0, 2))

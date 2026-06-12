@@ -176,6 +176,7 @@ class OffBottomTracker:
     """
 
     def __init__(self, initial: float, window: int = 10, learning_rate: float = 0.3):
+        self._initial = initial
         self._value = initial
         self._window = window
         self._rate = learning_rate
@@ -202,12 +203,19 @@ class OffBottomTracker:
 
         When no explicit off-bottom signal exists, the minimum torque
         over a sliding window approximates the off-bottom baseline.
+
+        Follows torque minima downward to detect off-bottom events.
+        Recovers upward at a slower rate so the tracker doesn't drift
+        permanently low after a transient torque drop (e.g., stick-slip release).
         """
         self._buffer.append(torque)
         if len(self._buffer) >= self._window:
             candidate = float(np.min(self._buffer))
             if candidate < self._value:
                 self._value += self._rate * (candidate - self._value)
+            elif candidate > self._value and self._value < self._initial:
+                self._value += (self._rate * 0.25) * (candidate - self._value)
+                self._value = min(self._value, self._initial)
             self._buffer.clear()
 
     def reset(self, value: float) -> None:

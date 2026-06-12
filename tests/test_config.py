@@ -19,8 +19,8 @@ def test_config_defaults():
     assert cfg.pipeline.chunk_size == 10
     assert cfg.pipeline.baseline_rpm == 100.0
     assert cfg.pipeline.baseline_wob == 50000.0
-    assert cfg.filter.low_hz == 0.5
-    assert cfg.filter.high_hz == 8.0
+    assert cfg.filter.low_hz == 1.0
+    assert cfg.filter.high_hz == 5.0
     assert cfg.filter.order == 4
     assert cfg.drill_string.shear_modulus == 80e9
     assert cfg.drill_string.length == 1000.0
@@ -34,7 +34,7 @@ def test_config_defaults():
 
 def test_sub_configs():
     assert PipelineConfig().window_seconds == 5.0
-    assert FilterConfig().low_hz == 0.5
+    assert FilterConfig().low_hz == 1.0
     assert DrillStringConfig().shear_modulus == 80e9
     assert SidebandConfig().max_order == 3
     assert AssessmentConfig().mitigate_threshold == 0.005

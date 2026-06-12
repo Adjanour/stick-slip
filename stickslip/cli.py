@@ -4,31 +4,40 @@ CLI entrypoint — wires shell to core, emits events to a caller-supplied sink.
 Two parallel detection tracks (threaded):
   1. Sideband analysis (FFT on RPM) → StickSlipEvent
   2. Torsional energy accumulation (torque) → EnergyEvent
+
+Thread safety: a threading.Barrier keeps both tracks on the same CSV/sensor
+chunk at the same wall-clock time.  Exceptions in either track abort the
+barrier so the other track does not hang forever.
 """
 
 from __future__ import annotations
 
 import argparse
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
 from .assessment import assess
 from .buffer import make_buffer
+from .campbell import CampbellCollector, CampbellPoint
 from .config import Config, PipelineConfig, load_config
 from .dashboard import Dashboard, run_dashboard, stop_dashboard
 from .energy import EnergyHistory, OffBottomTracker, compute_energy
 from .history import ModulationHistory
 from .mitigation import MitigationController
 from .pipeline import compose
-from .shell import csv_chunk_stream
+from .shell import SharedCsvSource
 from .sidebands import compute_fm, detect_sidebands
+from .ssi import compute_ssi
 from .transforms import bandpass, detrend, fft_analyze, windowed
 from .types import (
     DrillStringParams,
     EnergyEvent,
+    MINIMAL,
     MitigationSignal,
     StickSlipAssessment,
     StickSlipEvent,
@@ -37,6 +46,7 @@ from .types import (
 
 StickSlipSink = Callable[[StickSlipEvent], None]
 EnergySink = Callable[[EnergyEvent], None]
+PausedCallback = Callable[[bool], None]
 
 
 def build_pipeline(fc: Config) -> Callable:
@@ -49,11 +59,71 @@ def build_pipeline(fc: Config) -> Callable:
     )
 
 
+# ---------------------------------------------------------------------------
+# NaN / inf guard — replace non-finite values with 0 to prevent silent
+# propagation through FFT / statistics.
+# ---------------------------------------------------------------------------
+
+_BAD_VALUE = 0.0
+
+
+def _guard_chunk(chunk: np.ndarray) -> np.ndarray:
+    mask = ~np.isfinite(chunk)
+    if np.any(mask):
+        chunk = chunk.copy()
+        chunk[mask] = _BAD_VALUE
+    return chunk
+
+
+def _guard_signal_samples(signal: Any) -> Any:
+    """Guard Signal.samples in-place (called after push, before FFT)."""
+    mask = ~np.isfinite(signal.samples)
+    if np.any(mask):
+        signal.samples = signal.samples.copy()
+        signal.samples[mask] = _BAD_VALUE
+    return signal
+
+
+# ---------------------------------------------------------------------------
+# Shared barrier timeout constant (seconds)
+#   If a barrier.wait() exceeds this, we assume the other thread is dead
+#   and abort.  With a 5-second FFT window and 50 Hz sampling, each chunk
+#   takes ~0.2 s of wall time, so 10x margin (2 s) is generous.
+# ---------------------------------------------------------------------------
+
+_BARRIER_TIMEOUT = 30.0
+
+
+def _safe_barrier_wait(barrier: Optional[threading.Barrier]) -> None:
+    """Wait on the barrier with a timeout; abort on timeout so no deadlock."""
+    if barrier is None:
+        return
+    try:
+        barrier.wait(timeout=_BARRIER_TIMEOUT)
+    except threading.BrokenBarrierError:
+        pass  # peer already aborted — exit gracefully
+    except threading.BarrierError:
+        try:
+            barrier.abort()
+        except threading.BrokenBarrierError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Detection tracks
+# ---------------------------------------------------------------------------
+
+
 def _sideband_track(
     *,
     cfg: Config,
     stick_slip_sink: Optional[StickSlipSink] = None,
     stop_event: Optional[Event] = None,
+    campbell_collector: Optional[CampbellCollector] = None,
+    paused_callback: Optional[PausedCallback] = None,
+    source: Optional[Any] = None,
+    barrier: Optional[threading.Barrier] = None,
+    n_chunks: Optional[int] = None,
 ) -> None:
     """Thread target: read RPM chunks, buffer, FFT, detect sidebands, emit StickSlipEvents."""
     p = cfg.pipeline
@@ -71,50 +141,110 @@ def _sideband_track(
             material_density=cfg.drill_string.material_density,
         )
     )
-    n_chunks = max(1, int(p.duration_seconds * p.sample_rate) // p.chunk_size)
-    stream = csv_chunk_stream(
-        sample_rate=p.sample_rate, chunk_size=p.chunk_size, column="bit_rpm"
-    )
+    if n_chunks is None:
+        n_chunks = max(1, int(p.duration_seconds * p.sample_rate) // p.chunk_size)
 
     sb = cfg.sideband
+    ac = cfg.assessment
+    zero_since: Optional[float] = None
+    last_paused_state = False
+    prev_status: str = MINIMAL
+    rpm_zero_threshold = p.rpm_zero_threshold
+    paused_duration = p.paused_duration
+
+    barrier_exc: Optional[BaseException] = None
+
     for _ in range(n_chunks):
         if stop_event and stop_event.is_set():
             break
-        chunk, ts = next(stream)
-        buffer = buffer.push(new_samples=chunk, timestamp=ts)
-        signal = buffer.to_signal()
-        if signal is not None:
-            spectral = process(signal)
-            sideband_result = detect_sidebands(
-                spectral,
-                fm=fm,
-                n_max=sb.max_order,
-                search_window_hz=sb.search_window_hz,
-                min_ratio=sb.min_ratio,
-            )
-            history.update(sideband_result)
-            assessment: StickSlipAssessment = assess(
-                sideband_result=sideband_result,
-                growth_rate=history.growth_rate(),
-                is_growing=history.is_growing(),
-                mitigate_threshold=cfg.assessment.mitigate_threshold,
-            )
-            if stick_slip_sink is not None:
-                stick_slip_sink(
-                    StickSlipEvent(
-                        version="v1",
-                        source="stickslip-cli",
-                        timestamp=assessment.timestamp,
-                        channel=assessment.channel,
-                        status=assessment.status,
-                        carrier_frequency=assessment.carrier_frequency,
-                        modulation_frequency=assessment.modulation_frequency,
-                        modulation_index=assessment.modulation_index,
-                        growth_rate=assessment.growth_rate,
-                        sidebands_present=assessment.sidebands_present,
-                        sidebands_growing=assessment.sidebands_growing,
-                    )
+        try:
+            chunk = _guard_chunk(source.next_rpm())
+            ts = time.time()
+            buffer.push(new_samples=chunk, timestamp=ts)
+            signal = buffer.to_signal()
+
+            # Detect drilling paused (RPM near zero for paused_duration seconds)
+            chunk_mean = float(np.mean(chunk))
+            if chunk_mean < rpm_zero_threshold:
+                if zero_since is None:
+                    zero_since = ts
+                elif ts - zero_since >= paused_duration and not last_paused_state:
+                    last_paused_state = True
+                    if paused_callback is not None:
+                        paused_callback(True)
+            else:
+                if last_paused_state:
+                    last_paused_state = False
+                    if paused_callback is not None:
+                        paused_callback(False)
+                zero_since = None
+
+            if signal is not None:
+                _guard_signal_samples(signal)
+                spectral = process(signal)
+                sideband_result = detect_sidebands(
+                    spectral,
+                    fm=fm,
+                    n_max=sb.max_order,
+                    search_window_hz=sb.search_window_hz,
+                    min_ratio=sb.min_ratio,
+                    min_carrier_magnitude=sb.min_carrier_magnitude,
+                    carrier_magnitude_relative=sb.carrier_magnitude_relative,
                 )
+                history.update(sideband_result)
+                assessment: StickSlipAssessment = assess(
+                    sideband_result=sideband_result,
+                    growth_rate=history.growth_rate(),
+                    is_growing=history.is_growing(),
+                    mitigate_threshold=ac.mitigate_threshold,
+                    absolute_mitigate_mi=ac.absolute_mitigate_mi,
+                    prev_status=prev_status,
+                    hysteresis_release_mi=ac.hysteresis_release_mi,
+                    hysteresis_release_rate=ac.hysteresis_release_rate,
+                )
+                prev_status = assessment.status
+                if campbell_collector is not None:
+                    rpm_pt = assessment.carrier_frequency * 60.0
+                    ssi_val = compute_ssi(assessment.modulation_index)
+                    campbell_collector.add(
+                        CampbellPoint(
+                            rpm=rpm_pt,
+                            fm=assessment.modulation_frequency,
+                            ssi=ssi_val,
+                            timestamp=assessment.timestamp,
+                            status=assessment.status,
+                        )
+                    )
+                if stick_slip_sink is not None:
+                    stick_slip_sink(
+                        StickSlipEvent(
+                            version="v1",
+                            source="stickslip-cli",
+                            timestamp=assessment.timestamp,
+                            channel=assessment.channel,
+                            status=assessment.status,
+                            carrier_frequency=assessment.carrier_frequency,
+                            modulation_frequency=assessment.modulation_frequency,
+                            modulation_index=assessment.modulation_index,
+                            growth_rate=assessment.growth_rate,
+                            sidebands_present=assessment.sidebands_present,
+                            sidebands_growing=assessment.sidebands_growing,
+                        )
+                    )
+
+            _safe_barrier_wait(barrier)
+
+        except BaseException as exc:
+            barrier_exc = exc
+            if barrier is not None:
+                try:
+                    barrier.abort()
+                except threading.BrokenBarrierError:
+                    pass
+            break
+
+    if barrier_exc is not None and not isinstance(barrier_exc, SystemExit):
+        raise barrier_exc  # type: ignore[misc]
 
 
 def _energy_track(
@@ -122,6 +252,9 @@ def _energy_track(
     cfg: Config,
     energy_sink: Optional[EnergySink] = None,
     stop_event: Optional[Event] = None,
+    source: Optional[Any] = None,
+    barrier: Optional[threading.Barrier] = None,
+    n_chunks: Optional[int] = None,
 ) -> None:
     """Thread target: read torque chunks, compute torsional energy, emit EnergyEvents."""
     p = cfg.pipeline
@@ -131,78 +264,93 @@ def _energy_track(
         channel="Torque",
     )
     energy_history = EnergyHistory()
-    n_chunks = max(1, int(p.duration_seconds * p.sample_rate) // p.chunk_size)
-    stream = csv_chunk_stream(
-        sample_rate=p.sample_rate, chunk_size=p.chunk_size, column="torque"
-    )
+    if n_chunks is None:
+        n_chunks = max(1, int(p.duration_seconds * p.sample_rate) // p.chunk_size)
 
     prev_temp_bit: Optional[float] = None
     TEMP_SIGNIFICANT_DELTA = 5.0  # °C
     off_tracker = OffBottomTracker(initial=cfg.bha.t_off_bottom)
 
+    barrier_exc: Optional[BaseException] = None
+
     for _ in range(n_chunks):
         if stop_event and stop_event.is_set():
             break
-        chunk, ts = next(stream)
-        buffer = buffer.push(new_samples=chunk, timestamp=ts)
-        signal = buffer.to_signal()
-        if signal is not None:
-            mean_torque = float(np.mean(signal.samples))
+        try:
+            chunk = _guard_chunk(source.next_torque())
+            ts = time.time()
+            buffer.push(new_samples=chunk, timestamp=ts)
+            signal = buffer.to_signal()
+            if signal is not None:
+                _guard_signal_samples(signal)
+                mean_torque = float(np.mean(signal.samples))
 
-            # Dynamically recapture off-bottom torque from rolling minima
-            off_tracker.update_min(mean_torque)
+                off_tracker.update_min(mean_torque)
 
-            result = compute_energy(
-                t_surface=mean_torque,
-                bit_depth=p.bit_depth,
-                config=cfg.bha,
-                t_off_bottom=off_tracker.value,
-            )
-            result = TorsionalEnergyResult(
-                timestamp=ts,
-                t_surface=result.t_surface,
-                t_bit=result.t_bit,
-                k_total=result.k_total,
-                theta=result.theta,
-                energy=result.energy,
-                bit_depth=result.bit_depth,
-                temp_bit=result.temp_bit,
-                g_derating_pct=result.g_derating_pct,
-                t_off_bottom=off_tracker.value,
-            )
-
-            # Detect significant temperature changes (depth-driven)
-            if prev_temp_bit is not None:
-                delta = abs(result.temp_bit - prev_temp_bit)
-                if delta >= TEMP_SIGNIFICANT_DELTA:
-                    print(
-                        f"[TEMP] significant change: "
-                        f"{prev_temp_bit:.1f}°C → {result.temp_bit:.1f}°C "
-                        f"at {p.bit_depth:.0f}m "
-                        f"(Δ{delta:.1f}°C, G derating {result.g_derating_pct:.2f}%)"
-                    )
-            prev_temp_bit = result.temp_bit
-
-            energy_history.update(result)
-            assessment = energy_history.assess(ts)
-            if energy_sink is not None:
-                energy_sink(
-                    EnergyEvent(
-                        version="v1",
-                        source="stickslip-cli",
-                        timestamp=ts,
-                        status=assessment.status,
-                        energy=assessment.energy,
-                        peak_energy=assessment.peak_energy,
-                        drop_ratio=assessment.drop_ratio,
-                        t_bit=result.t_bit,
-                        k_total=result.k_total,
-                        bit_depth=p.bit_depth,
-                        temp_bit=result.temp_bit,
-                        g_derating_pct=result.g_derating_pct,
-                        t_off_bottom=off_tracker.value,
-                    )
+                result = compute_energy(
+                    t_surface=mean_torque,
+                    bit_depth=p.bit_depth,
+                    config=cfg.bha,
+                    t_off_bottom=off_tracker.value,
                 )
+                result = TorsionalEnergyResult(
+                    timestamp=ts,
+                    t_surface=result.t_surface,
+                    t_bit=result.t_bit,
+                    k_total=result.k_total,
+                    theta=result.theta,
+                    energy=result.energy,
+                    bit_depth=result.bit_depth,
+                    temp_bit=result.temp_bit,
+                    g_derating_pct=result.g_derating_pct,
+                    t_off_bottom=off_tracker.value,
+                )
+
+                if prev_temp_bit is not None:
+                    delta = abs(result.temp_bit - prev_temp_bit)
+                    if delta >= TEMP_SIGNIFICANT_DELTA:
+                        print(
+                            f"[TEMP] significant change: "
+                            f"{prev_temp_bit:.1f}°C → {result.temp_bit:.1f}°C "
+                            f"at {p.bit_depth:.0f}m "
+                            f"(Δ{delta:.1f}°C, G derating {result.g_derating_pct:.2f}%)"
+                        )
+                prev_temp_bit = result.temp_bit
+
+                energy_history.update(result)
+                assessment = energy_history.assess(ts)
+                if energy_sink is not None:
+                    energy_sink(
+                        EnergyEvent(
+                            version="v1",
+                            source="stickslip-cli",
+                            timestamp=ts,
+                            status=assessment.status,
+                            energy=assessment.energy,
+                            peak_energy=assessment.peak_energy,
+                            drop_ratio=assessment.drop_ratio,
+                            t_bit=result.t_bit,
+                            k_total=result.k_total,
+                            bit_depth=p.bit_depth,
+                            temp_bit=result.temp_bit,
+                            g_derating_pct=result.g_derating_pct,
+                            t_off_bottom=off_tracker.value,
+                        )
+                    )
+
+            _safe_barrier_wait(barrier)
+
+        except BaseException as exc:
+            barrier_exc = exc
+            if barrier is not None:
+                try:
+                    barrier.abort()
+                except threading.BrokenBarrierError:
+                    pass
+            break
+
+    if barrier_exc is not None and not isinstance(barrier_exc, SystemExit):
+        raise barrier_exc  # type: ignore[misc]
 
 
 def run(
@@ -211,23 +359,48 @@ def run(
     stick_slip_sink: Optional[StickSlipSink] = None,
     energy_sink: Optional[EnergySink] = None,
     stop_event: Optional[Event] = None,
+    campbell_collector: Optional[CampbellCollector] = None,
+    paused_callback: Optional[PausedCallback] = None,
 ) -> None:
     """Run both detection tracks in parallel via ThreadPoolExecutor."""
+    cfg.validate()
+
+    source = SharedCsvSource(
+        chunk_size=cfg.pipeline.chunk_size, sample_rate=cfg.pipeline.sample_rate
+    )
+    n_chunks = max(1, source.total_values // cfg.pipeline.chunk_size)
+    barrier: threading.Barrier = threading.Barrier(2, action=source.advance)
+
     with ThreadPoolExecutor(max_workers=2) as ex:
         ss = ex.submit(
             _sideband_track,
             cfg=cfg,
             stick_slip_sink=stick_slip_sink,
             stop_event=stop_event,
+            campbell_collector=campbell_collector,
+            paused_callback=paused_callback,
+            source=source,
+            barrier=barrier,
+            n_chunks=n_chunks,
         )
         en = ex.submit(
             _energy_track,
             cfg=cfg,
             energy_sink=energy_sink,
             stop_event=stop_event,
+            source=source,
+            barrier=barrier,
+            n_chunks=n_chunks,
         )
+        exceptions: list[BaseException] = []
         for f in (ss, en):
-            f.result()
+            try:
+                f.result()
+            except BaseException as exc:
+                exceptions.append(exc)
+        if exceptions:
+            msg = "; ".join(str(e) for e in exceptions)
+            raise RuntimeError(f"Pipeline tracks failed: {msg}")
 
 
 def main() -> None:
@@ -252,9 +425,12 @@ def main() -> None:
     parser.add_argument("--web", action="store_true", help="enable FastHTML web UI")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="web UI host")
     parser.add_argument("--port", type=int, default=8080, help="web UI port")
+    parser.add_argument(
+        "--dwis-endpoint", type=str, default=None,
+        help="OPC-UA endpoint for D‑WIS live data (default: csv replay)",
+    )
     args = parser.parse_args()
 
-    # Start from config file or defaults, then overlay CLI args
     cfg = load_config(args.config) if args.config else Config(dashboard=args.dashboard)
 
     overrides = {}
@@ -294,10 +470,33 @@ def main() -> None:
             sideband=cfg.sideband,
             assessment=cfg.assessment,
             mitigation=cfg.mitigation,
+            dwis=cfg.dwis,
             dashboard=args.dashboard,
         )
 
-    # Route to the appropriate UI
+    # D‑WIS endpoint overrides config
+    if args.dwis_endpoint is not None:
+        dwis = cfg.dwis
+        cfg = Config(
+            pipeline=cfg.pipeline,
+            filter=cfg.filter,
+            drill_string=cfg.drill_string,
+            bha=cfg.bha,
+            sideband=cfg.sideband,
+            assessment=cfg.assessment,
+            mitigation=cfg.mitigation,
+            dwis=DwisConfig(
+                endpoint=args.dwis_endpoint,
+                username=dwis.username,
+                password=dwis.password,
+                reconnect_attempts=dwis.reconnect_attempts,
+                reconnect_delay_s=dwis.reconnect_delay_s,
+            ),
+            dashboard=args.dashboard,
+        )
+
+    cfg.validate()
+
     if args.tui:
         _run_tui(cfg)
     elif args.web:
@@ -353,7 +552,12 @@ def _run_rich(cfg: Config) -> None:
 
     live = run_dashboard(dashboard) if dashboard else None
     try:
-        run(cfg=cfg, stick_slip_sink=_ss_sink, energy_sink=_energy_sink)
+        run(
+            cfg=cfg,
+            stick_slip_sink=_ss_sink,
+            energy_sink=_energy_sink,
+            paused_callback=dashboard.on_paused if dashboard else None,
+        )
     finally:
         if live:
             stop_dashboard(live)

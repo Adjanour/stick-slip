@@ -20,14 +20,29 @@ def detect_sidebands(
     n_max: int = 3,
     search_window_hz: float = 0.15,
     min_ratio: float = 0.05,
+    min_carrier_magnitude: float = 0.1,
+    carrier_magnitude_relative: bool = True,
 ) -> SidebandResult:
-    """Search for FM sidebands at fc ± n·fm within ±search_window_hz of each expected peak."""
+    """Search for FM sidebands at fc ± n·fm within ±search_window_hz of each expected peak.
+
+    When carrier_magnitude_relative is True (default), min_carrier_magnitude is
+    interpreted as a fraction of the spectral median magnitude — this makes the
+    threshold adaptive to signal amplitude, avoiding silent discard on quiet
+    signals and false triggers on loud noise.
+    """
+
     freqs = spectral.frequencies
     mags = spectral.magnitudes
     fc = spectral.peak_frequency
     mc = spectral.peak_magnitude
 
-    if mc < 1e-12:
+    if carrier_magnitude_relative:
+        median_mag = float(np.median(mags[mags > 0])) if np.any(mags > 0) else 1.0
+        threshold = median_mag * min_carrier_magnitude
+    else:
+        threshold = min_carrier_magnitude
+
+    if mc < threshold:
         return _empty(fc, mc, fm, spectral)
 
     orders = np.arange(1, n_max + 1, dtype=np.int32)

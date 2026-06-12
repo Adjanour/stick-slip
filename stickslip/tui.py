@@ -6,6 +6,7 @@ Run via: stickslip --tui
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from queue import Queue
 from threading import Event, Thread
@@ -20,9 +21,21 @@ from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Footer, Header, Static
 
+from .campbell import CampbellCollector
 from .cli import run as run_pipeline
 from .config import Config
 from .mitigation import MitigationController
+from .ssi import (
+    SSI_MILD,
+    SSI_MODERATE,
+    SSI_NONE,
+    SSI_SEVERE,
+    SSI_CRITICAL,
+    SSI_STYLE,
+    compute_ssi,
+    ssi_class,
+    ssi_description,
+)
 from .types import (
     ENERGY_BUILDING,
     ENERGY_NORMAL,
@@ -36,7 +49,7 @@ from .types import (
     StickSlipEvent,
 )
 
-_STATUS_STYLE = {
+STATUS_STYLE = {
     MINIMAL: "green",
     STABLE: "cyan",
     INTENSIFYING: "yellow",
@@ -48,7 +61,7 @@ _STATUS_STYLE = {
 
 
 def _style(s: str) -> Text:
-    return Text(s, style=_STATUS_STYLE.get(s, "white"))
+    return Text(s, style=STATUS_STYLE.get(s, "white"))
 
 
 CSS = """
@@ -56,8 +69,13 @@ StickSlipTUI {
     background: $surface;
 }
 
+#alert-bar {
+    height: 3;
+    content-align: center middle;
+}
+
 #panels-row {
-    height: 50%;
+    height: 45%;
     min-height: 15;
 }
 
@@ -69,7 +87,7 @@ StickSlipTUI {
 }
 
 #events-box {
-    height: 50%;
+    height: 45%;
     min-height: 10;
     border: solid $secondary;
     padding: 0 1;
@@ -138,14 +156,17 @@ class StickSlipTUI(App):
         self._mitigation: Optional[MitigationSignal] = None
         self._events: deque = deque(maxlen=50)
         self._n_cycles = 0
+        self._drilling_paused = False
+        self._campbell = CampbellCollector()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield Static(id="alert-bar")
         yield Static(id="status-bar")
         with Horizontal(id="panels-row"):
             yield PanelWidget(id="sideband-panel", classes="panel-box")
             yield PanelWidget(id="energy-panel", classes="panel-box")
-            yield PanelWidget(id="mitigation-panel", classes="panel-box")
+            yield PanelWidget(id="ssi-panel", classes="panel-box")
         with Vertical(id="events-box"):
             yield Static(id="events-log")
         yield Footer()
@@ -193,22 +214,24 @@ class StickSlipTUI(App):
 
         return Panel(t, title="Torsional Energy", border_style="yellow")
 
-    def _render_mitigation(self) -> Panel:
-        m = self._mitigation
+    def _render_ssi(self) -> Panel:
+        ssi_val = compute_ssi(self._ss.modulation_index) if self._ss else 0.0
+        cls = ssi_class(ssi_val)
+        style = SSI_STYLE.get(cls, "white")
         t = Table.grid(padding=(0, 1))
         t.add_column()
         t.add_column(style="bold")
 
-        if m is not None:
-            t.add_row("RPM:", f"{m.rpm_setpoint:.1f}")
-            t.add_row("WOB:", f"{m.wob_setpoint:.0f} N")
-            t.add_row("Reason:", Text(m.reason[:50], style="dim"))
+        if self._ss is not None:
+            t.add_row("SSI:", Text(f"{ssi_val:.2f}%", style=f"bold {style}"))
+            t.add_row("Class:", Text(cls, style=style))
+            t.add_row("Description:", Text(ssi_description(ssi_val), style="dim"))
         else:
-            t.add_row("RPM:", Text("—", style="dim"))
-            t.add_row("WOB:", Text("—", style="dim"))
-            t.add_row("Reason:", Text("awaiting first event", style="dim"))
+            t.add_row("SSI:", Text("—", style="dim"))
+            t.add_row("Class:", Text("awaiting data", style="dim"))
+            t.add_row("Description:", Text("", style="dim"))
 
-        return Panel(t, title="Mitigation Setpoints", border_style="green")
+        return Panel(t, title="Stick-Slip Severity Index", border_style=style)
 
     def _render_events(self) -> Panel:
         t = Table.grid(padding=(0, 2))
@@ -225,10 +248,30 @@ class StickSlipTUI(App):
 
         return Panel(t, title="Events", border_style="dim")
 
+    def _render_alert(self) -> Panel:
+        if self._drilling_paused:
+            return Panel(
+                Text(" DRILLING PAUSED — RPM near zero for >6s ", style="bold white on red", justify="center"),
+                border_style="red",
+            )
+        ssi_val = compute_ssi(self._ss.modulation_index) if self._ss else 0.0
+        if ssi_val >= 3.0:
+            blink = " █ " if int(time.time() * 2) % 2 else "   "
+            return Panel(
+                Text(
+                    f"{blink} STICK-SLIP DETECTED — SSI={ssi_val:.1f}% {blink} ",
+                    style="bold white on red",
+                    justify="center",
+                ),
+                border_style="red",
+            )
+        return Panel(Text("", style="dim"), border_style="none")
+
     def _update_panels(self) -> None:
         self.query_one("#sideband-panel").update_content(self._render_sideband())
         self.query_one("#energy-panel").update_content(self._render_energy())
-        self.query_one("#mitigation-panel").update_content(self._render_mitigation())
+        self.query_one("#ssi-panel").update_content(self._render_ssi())
+        self.query_one("#alert-bar").update(self._render_alert())
         self.query_one("#events-log").update(self._render_events())
 
     def _drain_queue(self) -> None:
@@ -238,11 +281,12 @@ class StickSlipTUI(App):
                 kind, data = item
                 if kind == "ss":
                     self._ss = data
+                    ssi_val = compute_ssi(data.modulation_index)
                     self._events.append(
                         EventLine(
                             data.timestamp,
                             "SB",
-                            f"{data.status}  MI={data.modulation_index:.4f}",
+                            f"{data.status}  SSI={ssi_val:.1f}%",
                         )
                     )
                 elif kind == "energy":
@@ -257,6 +301,8 @@ class StickSlipTUI(App):
                     self._events.append(
                         EventLine(data.timestamp, "CTRL", data.reason[:55])
                     )
+                elif kind == "paused":
+                    self._drilling_paused = data
             except Exception:
                 break
         self._update_panels()
@@ -269,6 +315,9 @@ class StickSlipTUI(App):
 
     def _on_mitigation(self, signal: MitigationSignal) -> None:
         self._queue.put(("mitigation", signal))
+
+    def _on_paused(self, paused: bool) -> None:
+        self._queue.put(("paused", paused))
 
     def _run_pipeline_thread(self) -> None:
         mc = self.config.mitigation
@@ -300,10 +349,11 @@ class StickSlipTUI(App):
                 stick_slip_sink=ss_sink,
                 energy_sink=energy_sink,
                 stop_event=self._stop_event,
+                campbell_collector=self._campbell,
+                paused_callback=self._on_paused,
             )
         except Exception as exc:
             import traceback
-
             traceback.print_exc()
         finally:
             self.call_from_thread(self._on_pipeline_done)
@@ -315,7 +365,8 @@ class StickSlipTUI(App):
 
     def _update_status_bar(self) -> None:
         bar = self.query_one("#status-bar")
-        bar.update(f" {self.status_text} ")
+        paused_tag = " [PAUSED]" if self._drilling_paused else ""
+        bar.update(f" {self.status_text}{paused_tag} ")
         bar.styles.background = self.status_color
 
     def _start_pipeline(self) -> None:
@@ -326,6 +377,8 @@ class StickSlipTUI(App):
         self._energy = None
         self._mitigation = None
         self._events.clear()
+        self._drilling_paused = False
+        self._campbell.clear()
         self.status_text = "RUNNING"
         self.status_color = "green"
         self._update_status_bar()

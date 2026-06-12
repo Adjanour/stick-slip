@@ -1,7 +1,6 @@
 """Smoke tests for the FastHTML web UI module."""
 
 import threading
-import time
 
 from stickslip.types import (
     ENERGY_NORMAL,
@@ -14,11 +13,12 @@ from stickslip.webui import SharedState
 
 def test_shared_state_initial():
     s = SharedState()
-    ss, en, m, events = s.snapshot()
+    ss, en, m, events, paused = s.snapshot()
     assert ss is None
     assert en is None
     assert m is None
     assert events == []
+    assert not paused
 
 
 def test_shared_state_update_ss():
@@ -37,7 +37,7 @@ def test_shared_state_update_ss():
         sidebands_growing=True,
     )
     s.update_ss(event)
-    ss, _, _, events = s.snapshot()
+    ss, _, _, events, _ = s.snapshot()
     assert ss is event
     assert len(events) == 1
     assert events[0][1] == "SB"
@@ -58,7 +58,7 @@ def test_shared_state_update_energy():
         bit_depth=1000.0,
     )
     s.update_energy(event)
-    _, en, _, events = s.snapshot()
+    _, en, _, events, _ = s.snapshot()
     assert en is event
     assert len(events) == 1
     assert events[0][1] == "EN"
@@ -75,7 +75,7 @@ def test_shared_state_update_mitigation():
         reason="test signal",
     )
     s.update_mitigation(signal)
-    _, _, m, events = s.snapshot()
+    _, _, m, events, _ = s.snapshot()
     assert m is signal
     assert len(events) == 1
     assert events[0][1] == "CTRL"
@@ -109,7 +109,7 @@ def test_shared_state_thread_safety():
     for t in threads:
         t.join()
 
-    ss, _, _, events = s.snapshot()
+    ss, _, _, events, _ = s.snapshot()
     assert ss is not None
     assert len(events) <= 50
 
@@ -121,3 +121,45 @@ def test_shared_state_running_flag():
     assert s.running
     s.running = False
     assert not s.running
+
+
+def test_shared_state_paused():
+    s = SharedState()
+    _, _, _, _, paused = s.snapshot()
+    assert not paused
+    s.set_paused(True)
+    _, _, _, _, paused = s.snapshot()
+    assert paused
+
+
+def test_shared_state_all_events():
+    s = SharedState()
+    ev = StickSlipEvent(
+        version="v1", source="test", timestamp=1.0, channel="RPM",
+        status="MINIMAL", carrier_frequency=0.0, modulation_frequency=0.0,
+        modulation_index=0.0, growth_rate=0.0, sidebands_present=False,
+        sidebands_growing=False,
+    )
+    s.update_ss(ev)
+    s.update_ss(ev)
+    ss_list, _ = s.all_events()
+    assert len(ss_list) == 2
+
+
+def test_shared_state_clear():
+    s = SharedState()
+    s.update_ss(
+        StickSlipEvent(
+            version="v1", source="test", timestamp=1.0, channel="RPM",
+            status="MINIMAL", carrier_frequency=0.0, modulation_frequency=0.0,
+            modulation_index=0.0, growth_rate=0.0, sidebands_present=False,
+            sidebands_growing=False,
+        )
+    )
+    s.set_paused(True)
+    assert not s.snapshot()[0] is None
+    assert s.snapshot()[4]
+    s.clear()
+    assert s.snapshot()[0] is None
+    assert not s.snapshot()[4]
+    assert s.snapshot()[3] == []

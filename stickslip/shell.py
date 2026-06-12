@@ -1,114 +1,103 @@
 """
 Effectful shell — I/O lives here so the core stays pure.
+
+Sources: SharedCsvSource (historical replay), and the D‑WIS OPC‑UA connector
+for live competition data (see dwis.py).
+
+Competition design intent:
+  Historical CSV data is streamed as if from a digital twin.  On competition
+  day, the team's controller connects to the OpenLab simulator through the
+  D‑WIS OPC‑UA gateway instead of reading a file.  Both sources implement
+  the same next_rpm() / next_torque() / advance() interface so the pipeline
+  is source-agnostic.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
-from typing import Callable, Generator, Optional
+from typing import Optional
 
 import numpy as np
 
 
-SensorReader = Callable[[], float]
 DEFAULT_CSV_PATH = Path(__file__).resolve().parent.parent / "test.csv"
 
 
-def simulate_signal(
-    base: float = 120.0,
-    stick_slip_hz: float = 0.5,
-    stick_slip_amplitude: float = 30.0,
-    noise_std: float = 2.0,
-) -> SensorReader:
-    """Synthetic sensor: sine wave at torsional frequency + Gaussian noise."""
+class SharedCsvSource:
+    """Thread-safe CSV source that synchronizes two detection tracks via Barrier.
 
-    def _read() -> float:
-        t = time.time()
-        return (
-            base
-            + stick_slip_amplitude * np.sin(2 * np.pi * stick_slip_hz * t)
-            + np.random.normal(0.0, noise_std)
-        )
+    Both tracks share one source and a threading.Barrier(2, action=...).
+    After each chunk is read (both tracks), the barrier action advances the
+    shared index and sleeps per sample_rate, keeping the tracks in lockstep.
 
-    return _read
+    When the CSV is exhausted, the last row value is held (the pad-at-end
+    behaviour) so the pipeline sees a steady DC input rather than a short
+    chunk.
+    """
 
+    _NAN_PAD = 0.0
 
-# Loads a named column from CSV using numpy's structured array reader
-def _load_csv_column(path: Path, column: str = "bit_rpm") -> np.ndarray:
-    data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
-    if column not in data.dtype.names:
-        raise KeyError(f"CSV source requires a '{column}' column")
-    return data[column].astype(np.float64)
+    def __init__(
+        self,
+        path: Path = DEFAULT_CSV_PATH,
+        chunk_size: int = 10,
+        sample_rate: float = 50.0,
+    ):
+        raw = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding=None)
+        if raw.ndim != 1 or raw.dtype.names is None:
+            raise ValueError(
+                f"CSV must have named columns, got shape={raw.shape}"
+            )
+        for col in ("bit_rpm", "torque"):
+            if col not in raw.dtype.names:
+                raise KeyError(f"CSV missing required column '{col}'")
+        rpm = raw["bit_rpm"].astype(np.float64)
+        torque = raw["torque"].astype(np.float64)
+        # Replace NaN / inf with the pad value
+        rpm[~np.isfinite(rpm)] = self._NAN_PAD
+        torque[~np.isfinite(torque)] = self._NAN_PAD
+        self._rpm = rpm
+        self._torque = torque
+        self._n = len(self._rpm)
+        self._chunk_size = chunk_size
+        self._dt = 1.0 / sample_rate
+        self._index = 0
+        self._lock = threading.Lock()
 
+    @property
+    def total_values(self) -> int:
+        return self._n
 
-# Closure-based reader: advances through values, holds last on exhaustion
-def _values_reader(values: np.ndarray) -> SensorReader:
-    values = np.asarray(values, dtype=np.float64)
-    if len(values) == 0:
-        raise ValueError("CSV source requires at least one numeric value")
+    @property
+    def chunk_size(self) -> int:
+        return self._chunk_size
 
-    index = 0
-    n = len(values)
+    def _read_chunk(self, arr: np.ndarray) -> np.ndarray:
+        with self._lock:
+            i = self._index
+            end = i + self._chunk_size
+            if end <= self._n:
+                return arr[i:end].copy()
+            # Pad-at-end: fill remaining with last valid value
+            n_avail = max(0, self._n - i)
+            if n_avail == 0:
+                return np.full(self._chunk_size, arr[-1], dtype=np.float64)
+            chunk = np.empty(self._chunk_size, dtype=np.float64)
+            chunk[:n_avail] = arr[i:]
+            chunk[n_avail:] = arr[-1]
+            return chunk
 
-    def _read() -> float:
-        nonlocal index
-        value = float(values[index])
-        if index < n - 1:
-            index += 1
-        return value
+    def next_rpm(self) -> np.ndarray:
+        return self._read_chunk(self._rpm)
 
-    return _read
+    def next_torque(self) -> np.ndarray:
+        return self._read_chunk(self._torque)
 
-
-def csv_source(
-    data: Optional[np.ndarray] = None,
-    column: str = "bit_rpm",
-) -> SensorReader:
-    """Closure that advances through column values, holding the last on exhaustion."""
-    values = data if data is not None else _load_csv_column(DEFAULT_CSV_PATH, column)
-    return _values_reader(values)
-
-
-def csv_chunk_stream(
-    sample_rate: float = 50.0,
-    chunk_size: int = 10,
-    data: Optional[np.ndarray] = None,
-    column: str = "bit_rpm",
-) -> Generator[tuple[np.ndarray, float], None, None]:
-    """Yields fixed-size numpy chunks, sleeping between chunks to maintain the target sample rate."""
-    reader = csv_source(data, column=column)
-    dt = 1.0 / sample_rate
-
-    while True:
-        t0 = time.time()
-        chunk = np.array([reader() for _ in range(chunk_size)], dtype=np.float64)
-        yield chunk, t0
-
-        elapsed = time.time() - t0
-        sleep_time = dt * chunk_size - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-
-
-def sensor_stream(
-    sample_rate: float = 50.0,
-    channels: tuple[str, ...] = ("RPM", "Torque"),
-    sources: Optional[dict[str, SensorReader]] = None,
-) -> Generator[tuple[dict[str, float], float], None, None]:
-    """Multi-channel sensor loop: reads all channels, sleeps to maintain sample rate."""
-    readers = sources or {
-        "RPM": simulate_signal(120.0, 0.5, 30.0, 2.0),
-        "Torque": simulate_signal(1800.0, 0.5, 120.0, 8.0),
-    }
-    dt = 1.0 / sample_rate
-
-    while True:
-        t0 = time.time()
-        readings = {channel: float(readers[channel]()) for channel in channels}
-        yield readings, t0
-
-        elapsed = time.time() - t0
-        sleep_time = dt - elapsed
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+    def advance(self) -> None:
+        with self._lock:
+            self._index += self._chunk_size
+            sleep_time = self._dt * self._chunk_size
+            if sleep_time > 0:
+                time.sleep(sleep_time)

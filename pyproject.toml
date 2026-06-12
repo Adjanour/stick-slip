@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 tui = ["textual>=1.0"]
 web = ["python-fasthtml>=0.3", "uvicorn>=0.20"]
+campbell = ["matplotlib>=3.8"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

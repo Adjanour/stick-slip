@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Generate realistic stick-slip drilling data with coupled RPM-torque dynamics.
+Generate realistic stick-slip drilling data with smooth phase transitions.
 
-Models the drillstring as a torsional spring-damper with Coulomb bit friction,
-producing asymmetric stick-slip cycles across five severity phases.
+Models the drillstring as a torsional spring-damper with Stribeck bit friction
+(Coulomb + velocity-weakening), producing asymmetric stick-slip cycles with
+two torsional modes across five clear phases:
 
-Physics:
-  - Surface drive maintains constant RPM (ω_s = 120 RPM)
-  - Bit experiences Stribeck friction (static > dynamic)
-  - During stick (RPM ↓): torque builds up linearly as string twists
-  - During slip (RPM ↑): stored energy releases, torque drops
-  - T_surface = T_base + K·θ_twist + C·Δω
+  0–20 s   Normal drilling        RPM ~120, torque ~3500 Nm, low noise
+ 20–40 s   Gradual onset          RPM oscillations grow, torque cycles begin
+ 40–65 s   Full stick-slip        RPM swings 0→200 RPM, torque 3500→8000+ Nm
+ 65–80 s   Mitigation taking hold Oscillations dampen, torque range narrows
+ 80–100 s  Recovery / stable      Back to baseline
 
-Output matches format expected by stickslip.shell.csv_chunk_stream.
+Output format: timestamp,bit_rpm,torque  (matches csv_chunk_stream)
 """
 
 from __future__ import annotations
@@ -25,82 +25,120 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = PROJECT_ROOT / "test.csv"
 RNG = np.random.default_rng(42)
 
-# ---------------------------------------------------------------------------
 # Physical drillstring parameters
-# ---------------------------------------------------------------------------
-K_TORSION = 1500.0  # torsional stiffness (Nm/rad) — combined pipe + BHA
-C_DAMPING = 20.0  # structural damping (Nm·s/rad)
-SURFACE_RPM = 120.0  # top drive setpoint
-SURFACE_OMEGA = SURFACE_RPM * 2 * np.pi / 60.0  # rad/s
+K_TORSION = 1500.0       # torsional stiffness (Nm/rad)
+C_DAMPING = 20.0         # structural damping (Nm·s/rad)
+SURFACE_RPM = 120.0      # top drive setpoint
+SURFACE_OMEGA = SURFACE_RPM * 2 * np.pi / 60.0
+FRICTION_BASE = 3500.0   # baseline wellbore friction (Nm)
+F_NATURAL_1 = 0.35       # primary torsional natural frequency (Hz)
+F_NATURAL_2 = 0.82       # secondary torsional mode (Hz)
+K_DRAIN = 2.0            # theta_twist drain rate (1/s)
 
-FRICTION_BASE = 3500.0  # continuous wellbore friction torque (Nm)
+# Stribeck friction parameters
+T_STATIC = 5500.0        # static friction torque (Nm) — peak at zero velocity
+T_COULOMB = 3500.0       # Coulomb friction (Nm) — constant sliding term
+V_STRIBECK = 0.3         # Stribeck velocity (rad/s) — transition width
+STR_SLOPE = 0.15         # high-speed friction rise slope (Nm·s/rad)
 
-# Measurement noise
-NOISE_RPM_STD = 1.5
-NOISE_TORQUE_STD = 30.0
+# Noise floors
+NOISE_RPM_STABLE = 0.8
+NOISE_RPM_SEVERE = 4.0
+NOISE_TQ_STABLE = 15.0
+NOISE_TQ_SEVERE = 60.0
 
 
-def _severity(t: float) -> float:
-    """Phase-based stick-slip severity envelope."""
-    if t < 15.0:
-        return 0.02
-    if t < 30.0:
-        return 0.22
-    if t < 45.0:
-        return 0.50
-    if t < 65.0:
-        return 0.82
-    if t < 80.0:
-        return 0.55
-    return max(0.55 - 0.025 * (t - 80.0), 0.02)
+def _smooth_envelope(t: np.ndarray) -> np.ndarray:
+    """Smooth severity envelope using logistic transitions."""
+    sev = np.zeros_like(t)
+    mask = t < 20.0
+    sev[mask] = 0.01
+    mask = (t >= 20.0) & (t < 40.0)
+    x = (t[mask] - 20.0) / 20.0
+    sev[mask] = 0.01 + 0.84 / (1.0 + np.exp(-10.0 * (x - 0.5)))
+    mask = (t >= 40.0) & (t < 65.0)
+    sev[mask] = 0.85 + 0.08 * np.sin(2 * np.pi * 0.08 * t[mask])
+    mask = (t >= 65.0) & (t < 80.0)
+    x = (t[mask] - 65.0) / 15.0
+    sev[mask] = 0.10 + 0.75 / (1.0 + np.exp(8.0 * (x - 0.5)))
+    mask = (t >= 80.0) & (t < 85.0)
+    sev[mask] = 0.10 * np.exp(-0.8 * (t[mask] - 80.0))
+    mask = t >= 85.0
+    sev[mask] = 0.005
+    return sev
+
+
+def _stribeck_friction(omega_rel: float, severity: float = 1.0) -> float:
+    """FRICTION_BASE baseline + severity-scaled velocity-weakening peak."""
+    abs_omega = abs(omega_rel)
+    base = FRICTION_BASE
+    if abs_omega < 1e-6:
+        peak = T_STATIC * severity + FRICTION_BASE * (1.0 - severity)
+        return peak
+    stribeck_sign = np.sign(omega_rel)
+    drop = (T_STATIC - FRICTION_BASE) * severity
+    stribeck = drop * np.exp(-abs_omega / V_STRIBECK)
+    viscous = STR_SLOPE * omega_rel
+    return base + stribeck * stribeck_sign + viscous
 
 
 def generate(
-    duration: float = 100.0, dt: float = 0.1
+    duration: float = 100.0, dt: float = 0.02
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n = int(round(duration / dt))
     t = np.arange(n, dtype=np.float64) * dt
+    sev = _smooth_envelope(t)
 
     rpm = np.empty(n, dtype=np.float64)
     torque = np.empty(n, dtype=np.float64)
+    theta_twist = 0.0
 
-    theta_twist = 0.0  # accumulated twist angle (rad)
-    f_natural = 0.35  # torsional natural frequency (Hz)
-
-    # Duty cycle of the stick phase (remainder = slip phase)
     STICK_FRAC = 0.65
 
     for i in range(n):
         ti = t[i]
-        sev = _severity(ti)
+        s = sev[i]
 
-        # ---- Asymmetric RPM waveform ----
-        phase = (ti * f_natural) % 1.0
-        if phase < STICK_FRAC:
-            mod = -phase / STICK_FRAC  # -1 → 0 over stick phase
+        # ---- Asymmetric RPM waveform with two torsional modes ----
+        phase1 = (ti * F_NATURAL_1 * (1.0 + 0.05 * np.sin(0.1 * ti))) % 1.0
+        phase2 = (ti * F_NATURAL_2 * (1.0 + 0.03 * np.sin(0.15 * ti))) % 1.0
+
+        if phase1 < STICK_FRAC:
+            mod1 = -phase1 / STICK_FRAC
         else:
-            slip = (phase - STICK_FRAC) / (1.0 - STICK_FRAC)
-            mod = slip  # 0 → 1 over slip phase
+            mod1 = (phase1 - STICK_FRAC) / (1.0 - STICK_FRAC)
 
-        max_drop = SURFACE_RPM * 0.92
-        max_rise = SURFACE_RPM * 1.7
-        bit_rpm = SURFACE_RPM + sev * np.where(mod < 0, mod * max_drop, mod * max_rise)
+        if phase2 < STICK_FRAC:
+            mod2 = -phase2 / STICK_FRAC
+        else:
+            mod2 = (phase2 - STICK_FRAC) / (1.0 - STICK_FRAC)
+
+        max_drop = SURFACE_RPM * (0.85 + 0.10 * s)
+        max_rise = SURFACE_RPM * (0.50 + 1.20 * s)
+        second_mode_amp = 0.25 * s
+        bit_rpm = (
+            SURFACE_RPM
+            + s * np.where(mod1 < 0, mod1 * max_drop, mod1 * max_rise)
+            + second_mode_amp * SURFACE_RPM * mod2
+        )
         bit_rpm = max(bit_rpm, 0.0)
 
-        # ---- Coupled torque ----
+        # ---- Coupled torque with Stribeck friction ----
         omega_bit = bit_rpm * 2 * np.pi / 60.0
         delta_omega = SURFACE_OMEGA - omega_bit
 
-        theta_twist += delta_omega * dt
+        theta_twist += (delta_omega - K_DRAIN * theta_twist) * dt
         theta_twist = np.clip(theta_twist, -0.3, 2.5)
 
-        T_surface = FRICTION_BASE + K_TORSION * theta_twist + C_DAMPING * delta_omega
-        T_surface = max(T_surface, 100.0)
+        torsional = K_TORSION * theta_twist + C_DAMPING * delta_omega
+        friction = _stribeck_friction(delta_omega, severity=s)
+        T_surface = friction + torsional
 
-        # ---- Add measurement noise ----
-        noise_scale = 1.0 + 2.5 * sev
-        rpm[i] = bit_rpm + RNG.normal(0, NOISE_RPM_STD * noise_scale)
-        torque[i] = T_surface + RNG.normal(0, NOISE_TORQUE_STD * noise_scale)
+        # ---- Noise scales with severity ----
+        rpm_noise_std = NOISE_RPM_STABLE + (NOISE_RPM_SEVERE - NOISE_RPM_STABLE) * s
+        tq_noise_std = NOISE_TQ_STABLE + (NOISE_TQ_SEVERE - NOISE_TQ_STABLE) * s
+        rpm[i] = bit_rpm + RNG.normal(0, rpm_noise_std)
+        torque[i] = max(T_surface + RNG.normal(0, tq_noise_std), 100.0)
 
     rpm = np.maximum(rpm, 0.0)
     return t, rpm, torque
@@ -114,7 +152,7 @@ def save(t: np.ndarray, rpm: np.ndarray, torque: np.ndarray, path: Path = OUTPUT
         delimiter=",",
         header="timestamp,bit_rpm,torque",
         comments="",
-        fmt=["%.1f", "%.2f", "%.2f"],
+        fmt=["%.2f", "%.2f", "%.2f"],
     )
 
 
@@ -128,29 +166,28 @@ def print_stats(t, rpm, torque):
     )
 
     phases = [
-        (0, 15, "stable"),
-        (15, 30, "mild"),
-        (30, 45, "moderate"),
-        (45, 65, "severe"),
-        (65, 80, "recovery1"),
-        (80, 100, "recovery2"),
+        (0, 20, "normal"),
+        (20, 40, "onset"),
+        (40, 65, "severe"),
+        (65, 80, "mitigation"),
+        (80, 100, "recovery"),
     ]
     for start, end, label in phases:
         mask = (t >= start) & (t < end)
+        mean_rpm = rpm[mask].mean()
+        std_rpm = rpm[mask].std()
+        mean_tq = torque[mask].mean()
+        std_tq = torque[mask].std()
         print(
             f"  {label:>12s} ({start:3.0f}-{end:3.0f}s): "
-            f"RPM {rpm[mask].mean():5.0f}±{rpm[mask].std():4.0f}  "
-            f"Tq {torque[mask].mean():5.0f}±{torque[mask].std():4.0f}"
+            f"RPM {mean_rpm:5.0f}±{std_rpm:4.0f}  "
+            f"Tq {mean_tq:5.0f}±{std_tq:4.0f}"
         )
-    print(
-        f"  Above t_off_bottom (5000 Nm): {(torque > 5000).sum()} of {len(t)} samples"
-        f" ({(torque > 5000).mean() * 100:.1f}%)"
-    )
 
 
 if __name__ == "__main__":
     print("Generating realistic stick-slip data…")
-    t, rpm, torque = generate(duration=100.0, dt=0.1)
+    t, rpm, torque = generate(duration=100.0, dt=0.02)
     save(t, rpm, torque)
     print_stats(t, rpm, torque)
     print(f"Written: {OUTPUT}")

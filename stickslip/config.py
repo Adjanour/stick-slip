@@ -24,12 +24,14 @@ class PipelineConfig:
     bit_depth: float = 1000.0
     baseline_rpm: float = 100.0
     baseline_wob: float = 50000.0
+    rpm_zero_threshold: float = 1.0
+    paused_duration: float = 6.0
 
 
 @dataclass(frozen=True)
 class FilterConfig:
-    low_hz: float = 0.5
-    high_hz: float = 8.0
+    low_hz: float = 1.0
+    high_hz: float = 5.0
     order: int = 4
 
 
@@ -45,12 +47,17 @@ class SidebandConfig:
     max_order: int = 3
     min_ratio: float = 0.05
     search_window_hz: float = 0.15
+    min_carrier_magnitude: float = 0.1
+    carrier_magnitude_relative: bool = True
 
 
 @dataclass(frozen=True)
 class AssessmentConfig:
     growing_threshold: float = 0.001
     mitigate_threshold: float = 0.005
+    absolute_mitigate_mi: float = 0.05
+    hysteresis_release_mi: float = 0.03
+    hysteresis_release_rate: float = 0.002
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,15 @@ class MitigationConfig:
     mitigate_wob_cut: float = 0.80
     energy_rpm_boost: float = 1.20
     energy_building_wob_cut: float = 0.85
+
+
+@dataclass(frozen=True)
+class DwisConfig:
+    endpoint: str = "opc.tcp://localhost:4840"
+    username: str = ""
+    password: str = ""
+    reconnect_attempts: int = 3
+    reconnect_delay_s: float = 2.0
 
 
 def _default_bha() -> BHAConfig:
@@ -89,7 +105,47 @@ class Config:
     sideband: SidebandConfig = field(default_factory=SidebandConfig)
     assessment: AssessmentConfig = field(default_factory=AssessmentConfig)
     mitigation: MitigationConfig = field(default_factory=MitigationConfig)
+    dwis: DwisConfig = field(default_factory=DwisConfig)
     dashboard: bool = False
+
+    def validate(self) -> None:
+        issues: list[str] = []
+        p = self.pipeline
+        if p.window_seconds <= 0:
+            issues.append("pipeline.window_seconds must be > 0")
+        if p.sample_rate <= 0:
+            issues.append("pipeline.sample_rate must be > 0")
+        if p.chunk_size < 1:
+            issues.append("pipeline.chunk_size must be >= 1")
+        if p.chunk_size > p.window_seconds * p.sample_rate:
+            issues.append("pipeline.chunk_size exceeds window capacity")
+        if p.duration_seconds <= 0:
+            issues.append("pipeline.duration_seconds must be > 0")
+        if p.rpm_zero_threshold < 0:
+            issues.append("pipeline.rpm_zero_threshold must be >= 0")
+        if p.paused_duration <= 0:
+            issues.append("pipeline.paused_duration must be > 0")
+        f = self.filter
+        if f.low_hz <= 0:
+            issues.append("filter.low_hz must be > 0")
+        if f.high_hz <= f.low_hz:
+            issues.append("filter.high_hz must be > filter.low_hz")
+        if f.order < 1:
+            issues.append("filter.order must be >= 1")
+        sb = self.sideband
+        if sb.max_order < 1:
+            issues.append("sideband.max_order must be >= 1")
+        if not 0 < sb.min_ratio <= 1:
+            issues.append("sideband.min_ratio must be in (0, 1]")
+        if sb.search_window_hz <= 0:
+            issues.append("sideband.search_window_hz must be > 0")
+        a = self.assessment
+        if not 0 <= a.hysteresis_release_mi < a.absolute_mitigate_mi:
+            issues.append("assessment.hysteresis_release_mi must be < absolute_mitigate_mi and >= 0")
+        if a.hysteresis_release_rate < 0:
+            issues.append("assessment.hysteresis_release_rate must be >= 0")
+        if issues:
+            raise ValueError("Config validation failed:\n  - " + "\n  - ".join(issues))
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +173,8 @@ def load_config(path: str | Path) -> Config:
         kw["assessment"] = AssessmentConfig(**raw["assessment"])
     if "mitigation" in raw:
         kw["mitigation"] = MitigationConfig(**raw["mitigation"])
+    if "dwis" in raw:
+        kw["dwis"] = DwisConfig(**raw["dwis"])
     if "bha" in raw:
         bha_raw = raw["bha"]
         if "fixed_components" in bha_raw:
