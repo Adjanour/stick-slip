@@ -1,8 +1,8 @@
 # stickslip
 
 Dual-track stick-slip detection and mitigation pipeline for drilling automation.
-Functional-core / imperative-shell architecture — two parallel detection tracks
-feed a rule-based mitigation controller that emits setpoint adjustments.
+Reads RPM and torque (from CSV or live OPC-UA), runs two parallel detection
+threads, and outputs mitigation setpoints (RPM/WOB adjustments).
 
 ## Quick start
 
@@ -11,165 +11,129 @@ uv sync
 uv run stickslip
 ```
 
-Reads `test.csv` (oscillating `bit_rpm` and `torque` at 0.1 s intervals), runs both
-detection tracks in parallel threads, and prints events plus mitigation signals.
+Default mode prints events and mitigation signals to the terminal as they stream
+through the 100-second test CSV:
 
 ```text
-[   RPM] sb=STABLE mi=0.3488 g=+0.00000/s
 [ENERGY] status=ENERGY_NORMAL U=0.00J peak=0.00J drop=0.00%
-[   RPM] sb=MITIGATE mi=0.4487 g=+0.24971/s
-[MITIGATE] rpm=110 wob=40000 — stick-slip mitigation (MI=0.449)
+[   RPM] sb=MITIGATE mi=0.4991 g=+0.00000/s
+[MITIGATE] rpm=110 wob=40000 — stick-slip mitigation (MI, priority=50)
 ```
 
-## Architecture
+## UI modes
 
-```text
-                         ┌────────────────────────────────────────┐
-                         │  ThreadPoolExecutor (max_workers=2)    │
-                         │                                        │
-RPM CSV ────────────────→│  _sideband_track                       │
-  (csv_chunk_stream)     │    RollingBuffer → detrend             │
-                         │    → bandpass → window → fft_analyze   │
-                         │    → detect_sidebands → ModulationHist │
-                         │    → assess → StickSlipEvent ──────────┤──┐
-                         │                                        │  │
-Torque CSV ─────────────→│  _energy_track                         │  │
-  (csv_chunk_stream)     │    RollingBuffer → compute_energy      │  │
-                         │    → EnergyHistory → assess            │  │
-                         │    → EnergyEvent ──────────────────────┤──┤
-                         └────────────────────────────────────────┘  │
-                                                                     ├──→ MitigationController
-                                                                     │       ↓
-                                                                     │   MitigationSignal
-                                                                     │  (rpm_setpoint,wob_setpoint,reason)
-                                                                     │  
-                                                                     │   
+| Flag | Mode | Extra deps |
+|------|------|------------|
+| *(none)* | Rich terminal dashboard | — |
+| `--dashboard` | Rich live-updating dashboard | — |
+| `--tui` | Interactive Textual TUI (keyboard) | `uv sync --group tui` |
+| `--web` | FastHTML web UI (browser) | `uv sync --group web` |
+
+```bash
+uv run stickslip --web                    # web UI on http://0.0.0.0:8080
+uv run stickslip --tui                    # interactive terminal UI
+uv run stickslip --web --dashboard        # both
+uv run stickslip --config config.toml     # TOML config override
 ```
 
-Every function before the event boundary is deterministic and side-effect free.
-The `MitigationController` is the only stateful consumer — it tracks current
-setpoints and ramps back to baseline when conditions normalise.
+## Options
 
-### Detection tracks
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--duration-seconds` | 15.0 | How long to process (overrides CSV total) |
+| `--window-seconds` | 5.0 | FFT window size |
+| `--sample-rate` | 50.0 | Samples per second |
+| `--chunk-size` | 10 | Samples per chunk |
+| `--bit-depth` | 1000.0 | Current bit depth (m) |
+| `--baseline-rpm` | 100.0 | Normal operating RPM |
+| `--baseline-wob` | 50000.0 | Normal WOB (N) |
+| `--dwis-endpoint` | — | OPC-UA endpoint for live data |
+| `--host` / `--port` | 0.0.0.0:8080 | Web UI address |
+| `--config` | — | Path to TOML config file |
 
-| Track | Input | Pipeline | Output |
-|---|---|---|---|
-| **Sideband** | RPM | RollingBuffer → detrend → bandpass(0.5–8.0 Hz) → Hann window → FFT → detect_sidebands → ModulationHistory → assess | `StickSlipEvent` |
-| **Energy** | Torque | RollingBuffer → compute_energy (polar moment, temperature-derated G, series-spring stiffness) → EnergyHistory → assess | `EnergyEvent` |
+All flags can also be set in `config.toml`.
 
-### Sideband decision tree
+## How it works
 
-```text
-Sidebands present around fc?
-  No  → MINIMAL
-  Yes → Are sideband peaks growing over time (dMI/dt > 0)?
-           No  → STABLE
-           Yes → Is dMI/dt ≥ MITIGATE threshold?
-                    No  → INTENSIFYING
-                    Yes → MITIGATE
-```
+Two threads run in parallel, synced by a `threading.Barrier` so both read the
+same CSV chunk at the same wall-clock time:
 
-### Energy decision tree
+**Sideband track** (RPM) — detrend → bandpass (1–5 Hz) → FFT → detect FM
+sidebands around the carrier frequency → track modulation index growth →
+assess: MINIMAL → STABLE → INTENSIFYING → MITIGATE
 
-```text
-Buffer warm (≥ capacity)?
-  No  → ENERGY_NORMAL
-  Yes → Sharp drop from peak (≥ 50%)?
-           Yes → ENERGY_RELEASE
-           No  → Recent values trending up?
-                    Yes → ENERGY_BUILDING
-                    No  → ENERGY_NORMAL
-```
+**Energy track** (torque) — compute torsional energy from polar moment,
+temperature-derated shear modulus, series-spring stiffness → track energy
+build-up and sharp drops → assess: ENERGY_NORMAL → ENERGY_BUILDING →
+ENERGY_RELEASE
 
-### Mitigation controller rules
+The **MitigationController** fuses both assessments by priority and emits
+RPM/WOB setpoint adjustments:
 
-| Trigger | RPM adjustment | WOB adjustment |
-|---|---|---|
+| Trigger | RPM | WOB |
+|---------|-----|-----|
 | INTENSIFYING | +15% | −30% |
 | MITIGATE | +10% | −20% |
-| STABLE / MINIMAL | Ramp 5%/step toward baseline | Ramp 5%/step toward baseline |
 | ENERGY_RELEASE | +20% | −50% |
-| ENERGY_BUILDING | No change | −15% |
-
-### Pipeline stages
-
-| Stage | Module | What it does |
-|---|---|---|
-| `csv_chunk_stream` | `shell.py` | Reads `bit_rpm` or `torque` from CSV, yields fixed-size chunks |
-| `RollingBuffer.push` | `buffer.py` | Appends chunks to an immutable window, drops old samples |
-| `detrend` | `transforms.py` | Removes linear drift and DC offset |
-| `bandpass(0.5, 8.0)` | `transforms.py` | Isolates the torsional vibration band |
-| `windowed("hann")` | `transforms.py` | Reduces FFT spectral leakage |
-| `fft_analyze` | `transforms.py` | Computes magnitude spectrum, peak frequency, severity index |
-| `detect_sidebands` | `sidebands.py` | Searches for upper/lower sideband peaks around the carrier |
-| `ModulationHistory` | `history.py` | Tracks modulation index over time; fits linear trend with `lstsq` |
-| `assess` | `assessment.py` | Decision tree: MINIMAL → STABLE → INTENSIFYING → MITIGATE |
-| `compute_energy` | `energy.py` | `J=π/32·(OD⁴−ID⁴)`, temperature-derated G, series-spring K, `U=T²/2K` |
-| `EnergyHistory` | `energy.py` | Ring buffer of energy values, detects sharp drops |
-| `MitigationController` | `mitigation.py` | Consumes `StickSlipEvent` + `EnergyEvent`, emits `MitigationSignal` |
-
-### Types
-
-| Type | Module | Fields |
-|---|---|---|
-| `StickSlipEvent` | `types.py` | `version`, `source`, `timestamp`, `channel`, `status`, `carrier_frequency`, `modulation_frequency`, `modulation_index`, `growth_rate`, `sidebands_present`, `sidebands_growing` |
-| `EnergyEvent` | `types.py` | `version`, `source`, `timestamp`, `status`, `energy`, `peak_energy`, `drop_ratio`, `t_bit`, `k_total`, `bit_depth` |
-| `MitigationSignal` | `types.py` | `version`, `source`, `timestamp`, `rpm_setpoint`, `wob_setpoint`, `reason` |
-
-## Event boundary
-
-Both detection tracks emit versioned, transport-agnostic events to caller-supplied
-sink callbacks. The `MitigationController` subscribes to both event types and
-outputs `MitigationSignal` to its own sink — keeping detection, mitigation logic,
-and actuation decoupled.
-
-```python
-def my_sink(signal: MitigationSignal) -> None:
-    # Publish RPM/WOB setpoints to OpenLab via D-WIS
-    dwis.send_setpoints(rpm=signal.rpm_setpoint, wob=signal.wob_setpoint)
-
-controller = MitigationController(
-    baseline_rpm=100.0, baseline_wob=50000.0,
-    sink=my_sink,
-)
-run(
-    stick_slip_sink=controller.on_stick_slip,
-    energy_sink=controller.on_energy,
-)
-```
+| ENERGY_BUILDING | — | −15% |
+| STABLE / MINIMAL | Ramp to baseline | Ramp to baseline |
 
 ## Project structure
 
-```bash
+```
 stickslip/
-  __init__.py     — Public exports
-  types.py        — Frozen dataclasses: Signal, SpectralResult, SidebandResult,
-                    TorsionalEnergyResult, EnergyAssessment, StickSlipAssessment,
-                    StickSlipEvent, EnergyEvent, MitigationSignal, etc.
-  buffer.py       — RollingBuffer (immutable, np.ndarray-backed)
-  transforms.py   — Pure signal transforms: detrend, bandpass, lowpass, fft_analyze
-  sidebands.py    — Sideband detection (data-oriented: parallel np.ndarray columns)
-  history.py      — ModulationHistory ring buffer + lstsq growth rate
-  assessment.py   — Decision tree: MINIMAL → STABLE → INTENSIFYING → MITIGATE
-  energy.py       — Torsional energy: polar moment, temperature-derated G,
-                    series-spring stiffness, EnergyHistory ring buffer
-  mitigation.py   — MitigationController: consumes events, emits setpoint signals
-  shell.py        — CSV acquisition (column-parameterised), simulated sensor stream
-  display.py      — Console display adapter
-  cli.py          — CLI entry point, threaded orchestration, event sinks
+  types.py        — Frozen dataclasses (Signal, Events, config types)
+  transforms.py   — Pure signal transforms (detrend, bandpass, FFT)
+  sidebands.py    — FM sideband detection on RPM spectrum
+  history.py      — Modulation index history + linear growth rate
+  assessment.py   — Decision tree (MINIMAL → STABLE → INTENSIFYING → MITIGATE)
+  energy.py       — Torsional energy model + EnergyHistory
+  mitigation.py   — MitigationController (rule-based setpoint fusion)
+  buffer.py       — RingBuffer (O(1) numpy ring buffer)
+  shell.py        — CSV data source (SharedCsvSource)
+  dwis.py         — OPC-UA connector stub for live competition data
+  campbell.py     — Campbell diagram collector (RPM vs frequency)
+  ssi.py          — Stick-Slip Severity Index (MI × 100)
+  report.py       — HTML report generator
+  dashboard.py    — Rich terminal dashboard
+  tui.py          — Textual interactive TUI
+  webui.py        — FastHTML web UI
+  config.py       — Nested dataclass config + TOML loading
+  cli.py          — CLI entry point + threaded orchestration
   pipeline.py     — compose() utility
-tests/
-  test_core.py       — Buffer, sensor stream, CSV source, FFT pipeline
-  test_sidebands.py  — Sideband detection, history, assessment, event shape
-  test_energy.py     — Energy pure functions, EnergyHistory, event shape
-  test_mitigation.py — MitigationController rules, ramping, signal shape
+test.csv          — 5000 rows, 50 Hz, 5 phases (normal → severe → recovery)
+config.toml       — Default configuration
 ```
 
-## Key design decisions
+## Test data
 
-- **Two parallel detection tracks** — RPM sidebands and torque energy run in separate threads, each with independent buffers and state. The `ThreadPoolExecutor` (max_workers=2) keeps them isolated.
-- **Transport-agnostic event boundary** — Detection never knows about mitigation or actuation. `StickSlipEvent`, `EnergyEvent`, and `MitigationSignal` are versioned dataclasses any service can consume.
-- **Mitigation is a separate consumer** — `MitigationController` subscribes to both event types and emits setpoint signals. Swap it out for a PID controller or ML policy without touching detection.
-- **Temperature-derated torsional model** — Shear modulus G drops 2.3% per 100 °C above surface temperature. Segments (drill collar, HWDP, drill pipe) act as springs in series.
-- **Data-oriented sidebands** — `SidebandResult` stores peaks as parallel `np.ndarray` columns instead of tuples.
-- **No pandas** — CSV reading uses `np.genfromtxt`.
+`test.csv` contains 100 seconds (5000 rows at 50 Hz) of simulated drilling data
+with Stribeck friction and two torsional modes:
+
+| Phase | Time | What happens |
+|-------|------|-------------|
+| Normal | 0–20s | Stable RPM, low torque variation |
+| Developing | 20–40s | Sidebands appear, MI growing |
+| Severe | 40–65s | Strong stick-slip, high MI |
+| Decaying | 65–85s | MI decreasing |
+| Recovery | 85–100s | Back to normal |
+
+## Dependencies
+
+Runtime: `numpy`, `rich`, `scipy`
+
+Optional:
+- `textual` — TUI mode (`uv sync --group tui`)
+- `python-fasthtml`, `uvicorn` — web UI mode (`uv sync --group web`)
+- `matplotlib` — Campbell diagram rendering (`uv sync --group campbell`)
+
+## Configuration
+
+All parameters live in `stickslip/config.py` as nested dataclasses with
+sensible defaults. Override via TOML:
+
+```bash
+uv run stickslip --config my_config.toml
+```
+
+See `config.toml` for all available fields.
